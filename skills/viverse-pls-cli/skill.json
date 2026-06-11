@@ -3,7 +3,7 @@
   "name": "viverse-pls-cli",
   "version": "1.1.0",
   "status": "active",
-  "description": "Upload and replace 3D model assets to VIVERSE using pls-cli, including list --group, XRG URL construction, and mixed --json stdout parsing",
+  "description": "Polygon Streaming 3D assets: use pls-cli to upload, replace, list, or delete assets; construct XRG URLs; or diagnose conversion failures.",
   "tags": ["viverse", "pls-cli", "upload", "assets", "3d-models", "cli"],
   "prerequisites": [
     "pls-cli binary (from GitHub Releases or built from source)",

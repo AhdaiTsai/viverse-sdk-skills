@@ -1,20 +1,23 @@
 ---
 name: viverse-pls-cli
-description: Upload and replace 3D model assets to VIVERSE using pls-cli. Use when the task involves uploading .zip/.glb/.obj files to VIVERSE, replacing existing assets, managing model conversion, or running pls-cli commands against stage/prod environments.
+description: Convert 3D models (.zip/.glb/.obj) to Polygon Streaming format on VIVERSE using pls-cli. Handles upload, replace, list, and delete operations. Use when the task involves converting models to Polygon Streaming, uploading assets, or managing assets on VIVERSE stage/prod environments.
 ---
 
-# pls-cli — VIVERSE Model Upload/Replace CLI
+# pls-cli — VIVERSE Polygon Streaming CLI
 
-Operational guide for AI agents running pls-cli to upload or replace 3D models on VIVERSE.
+Operational guide for AI agents running pls-cli to manage 3D model assets on VIVERSE.
 
-## When to Activate
+## Direct Invocation
 
-- User wants to upload a model file (.zip, .glb, .obj) to VIVERSE
-- User wants to replace an existing asset by asset ID
-- Running smoke tests or integration tests against stage API
-- Debugging upload/conversion failures
+When the user invokes this skill without naming an operation, respond in the user's language with this action menu, then ask which operation to perform:
 
----
+- **Upload:** `upload <model.zip|model.glb|model.obj> [to <group-uuid>] [stage]`
+- **Replace:** `replace <old-asset-id> with <model file> [stage]`
+- **List:** `list assets [in <group-uuid>] [stage]`
+- **Delete:** `delete <asset-id> [stage]`
+- **Tags:** `create, list, or assign asset tags`
+
+When the user names an operation, proceed with that operation rather than showing the menu.
 
 ## 0. Install pls-cli
 
@@ -195,7 +198,89 @@ Replace shares the same flags as upload except `--group` (originId is provided i
 
 ---
 
-## 5. Tag Management
+## 5. List Assets and Construct Playable URLs
+
+```bash
+# Human output auto-selects the first group if --group is omitted.
+pls-cli list
+
+# Machine-readable list requires an explicit group.
+pls-cli list --group=<group-uuid> --json
+
+# Stage environment
+pls-cli list --group=<group-uuid> --stage
+```
+
+### List flags reference
+
+| Flag      | Values | Default       | Notes                                                       |
+| --------- | ------ | ------------- | ----------------------------------------------------------- |
+| `--group` | UUID   | auto-selected | Required with `--json`; otherwise use the first group       |
+| `--stage` | bool   | false         | Use staging environment                                     |
+| `--json`  | bool   | false         | Requires `--group`; human messages go to stderr             |
+
+List JSON shape (v1.2.0):
+
+```json
+{
+  "assets": [
+    {
+      "id": "asset-uuid",
+      "name": "example-model",
+      "status": "ready",
+      "createdAt": "2026-01-01T00:00:00Z"
+    }
+  ]
+}
+```
+
+Upload JSON returns `assetId` and `status` only; construct the playable URL from the asset group UUID, not the account ID from `pls-cli status`:
+
+```
+https://stream.viverse.com/polygon_file/<group-uuid>/<asset-id>/model.xrg
+```
+
+On stage, use `https://stream-stage.viverse.com` with the same path. Existing enemy/player XRGs in a group reuse the same group UUID.
+
+After upload:
+
+1. Read `files[].assetId` from upload JSON (trailing object; see Section 8).
+2. Resolve `group-uuid` from `--group`, `PLS_CLI_TEST_GROUP_UUID`, or the `auto-selected group: ... (uuid)` line on human `pls-cli list` stderr/stdout.
+3. Write the constructed URL into the app manifest.
+4. Verify streaming with a **GET** Range request; `curl -I` plus a Range header ignores Range and returns 200:
+
+```bash
+curl -s -D - -o /tmp/xrg.bin -H 'Range: bytes=0-15' \
+  "https://stream.viverse.com/polygon_file/<group-uuid>/<asset-id>/model.xrg"
+# Expect HTTP 206, content-range: bytes 0-15/<len>, body starting with v.00001
+```
+
+`HEAD` without Range returning 200 is an existence check; `GET` 206 verifies streaming.
+
+---
+## 6. Delete Asset
+
+```bash
+# Delete an asset by ID
+pls-cli delete <asset-id>
+
+# Stage environment
+pls-cli delete <asset-id> --stage
+
+# Machine-readable output
+pls-cli delete <asset-id> --json
+```
+
+### Delete flags reference
+
+| Flag      | Values | Default | Notes                                             |
+| --------- | ------ | ------- | ------------------------------------------------- |
+| `--stage` | bool   | false   | Use staging environment                           |
+| `--json`  | bool   | false   | Write JSON to stdout; human messages go to stderr |
+
+---
+
+## 7. Tag Management
 
 Tags are labels you can attach to assets. You can create them, list them, and assign them to assets after upload.
 
@@ -273,186 +358,11 @@ pls-cli upload model.glb --group=<group-uuid> --tags=foo,bar --json
 2. Creates any tags that don't already exist
 3. Assigns all resolved tag UUIDs to the asset after conversion completes
 
----
+## 8. Machine-Readable Output (--json)
 
-## 5.5 List assets and construct the playable `.xrg` URL
+When code must consume `pls-cli --json` output, read [JSON output reference](references/json-output.md) before running the command. It covers trailing-JSON extraction, response shapes, conversion failures, and shell parsing.
 
-Upload JSON returns `assetId` and `status` only. It does **not** return a resource URL. Agents must build the URL.
-
-```
-https://stream.viverse.com/polygon_file/<group-uuid>/<asset-id>/model.xrg
-```
-
-On stage, use `https://stream-stage.viverse.com` with the same path.
-
-**The `<group-uuid>` prefix is the asset group UUID, not the account id from `pls-cli status`.** Existing enemy/player XRGs in a group reuse that same prefix.
-
-### `pls-cli list`
-
-```bash
-# Human output auto-selects the first group if --group is omitted.
-pls-cli list
-
-# Machine-readable list REQUIRES --group. Without it, --json stdout can be empty
-# even though the command exits 0.
-pls-cli list --group=<group-uuid> --json
-```
-
-List JSON shape (v1.2.0):
-
-```json
-{
-  "assets": [
-    {
-      "id": "asset-uuid",
-      "name": "example-model",
-      "status": "ready",
-      "createdAt": "2026-01-01T00:00:00Z"
-    }
-  ]
-}
-```
-
-There is still no `url` field. After upload:
-
-1. Read `files[].assetId` from upload JSON (trailing object; see Section 6).
-2. Resolve `group-uuid` from `--group`, `PLS_CLI_TEST_GROUP_UUID`, or the `auto-selected group: ... (uuid)` line on human `pls-cli list` stderr/stdout.
-3. Write `https://stream.viverse.com/polygon_file/<group-uuid>/<assetId>/model.xrg` into the app manifest.
-4. Verify with a **GET** Range request, not `curl -I` plus a Range header (HEAD ignores Range and returns 200):
-
-```bash
-curl -s -D - -o /tmp/xrg.bin -H 'Range: bytes=0-15' \
-  "https://stream.viverse.com/polygon_file/<group-uuid>/<asset-id>/model.xrg"
-# Expect HTTP 206, content-range: bytes 0-15/<len>, body starting with v.00001
-```
-
-`HEAD` without Range returning 200 is a useful existence check; `GET` 206 is the streaming check.
-
----
-
-## 6. Machine-Readable Output (--json)
-
-Always pass `--json` when the result needs to be parsed programmatically.
-
-**Intended split:** human-readable messages on stderr; structured result on stdout.
-
-**Actual upload behavior (v1.2.0):** S3 progress bars often print on **stdout** before the JSON object. `JSON.parse(stdout)` then fails. Extract the trailing JSON object:
-
-```python
-import json, re, sys
-raw = sys.stdin.read()
-match = re.search(r"\{[\s\S]*\}\s*$", raw)
-data = json.loads(match.group() if match else raw)
-```
-
-Redirect stdout to a file (`> /tmp/pls-upload.json`) and inspect stderr separately so progress noise does not mix with agent logs.
-
-### Upload JSON output
-
-```json
-{
-  "files": [
-    {
-      "file": "model.zip",
-      "assetId": "abc-123-uuid",
-      "status": "ready"
-    }
-  ]
-}
-```
-
-### Upload JSON output (with --tags)
-
-When `--tags` is used, the upload JSON output includes a `"tags"` field:
-
-```json
-{
-  "files": [
-    {
-      "file": "model.zip",
-      "assetId": "abc-123-uuid",
-      "status": "ready"
-    }
-  ],
-  "tags": [
-    { "uuid": "tag-uuid-1", "name": "foo" },
-    { "uuid": "tag-uuid-2", "name": "bar" }
-  ]
-}
-```
-
-### tag create JSON output
-
-```json
-{ "uuid": "tag-uuid-1", "name": "my-tag" }
-```
-
-### tag list JSON output
-
-```json
-{
-  "tags": [
-    { "uuid": "tag-uuid-1", "name": "foo" },
-    { "uuid": "tag-uuid-2", "name": "bar" }
-  ]
-}
-```
-
-### tag assign JSON output
-
-```json
-{ "assetId": "asset-uuid", "tagUuids": ["tag-uuid-1", "tag-uuid-2"] }
-```
-
-### Replace JSON output
-
-```json
-{
-  "originId": "old-asset-uuid",
-  "file": "new-model.glb",
-  "assetId": "new-asset-uuid",
-  "status": "ready"
-}
-```
-
-### Failure case
-
-```json
-{
-  "files": [
-    {
-      "file": "bad-model.zip",
-      "assetId": "abc-123-uuid",
-      "status": "failed",
-      "failedType": "convert",
-      "error": "Model file corrupted",
-      "errorCode": "INVALID_MODEL"
-    }
-  ]
-}
-```
-
-**Status values**: `"ready"` (success) | `"failed"` (conversion failed)
-
-### Shell parsing example
-
-```bash
-# Check if upload succeeded. Do not JSON.parse the raw stream; progress bars may precede JSON.
-pls-cli upload model.zip --json > /tmp/pls-upload.json 2>/tmp/pls-upload.err
-python3 - <<'PY'
-import json, re
-from pathlib import Path
-raw = Path("/tmp/pls-upload.json").read_text()
-match = re.search(r"\{[\s\S]*\}\s*$", raw)
-data = json.loads(match.group() if match else raw)
-file0 = data["files"][0]
-print(file0["status"], file0["assetId"])
-PY
-```
-
----
-
-## 7. What the CLI Does Internally
+## 9. What the CLI Does Internally
 
 Understanding this helps debug failures:
 
@@ -464,13 +374,19 @@ Understanding this helps debug failures:
 5. WebSocket wss://{domain}/management/user/ws  →  stream conversion progress
 6. Exit 0 on "ready", exit 1 on "failed"
 6.5. (optional) If --tags provided: resolve tag names → create missing tags → PUT /management/asset/:id/tags
-```
 
-Replace uses `PUT /management/asset/:originId` instead of POST at step 2.
+Replace uses PUT /management/asset/:originId instead of POST at step 2.
+
+List:
+  GET /management/assets?group={uuid}  →  return asset list
+
+Delete:
+  DELETE /management/asset/:id  →  remove asset
+```
 
 ---
 
-## 8. Supported File Formats
+## 10. Supported File Formats
 
 | Format | Notes                         |
 | ------ | ----------------------------- |
@@ -483,22 +399,7 @@ Max file size: 500 MB per file (FREE tier limit from API).
 
 ---
 
-## 9. Running Tests
-
-```bash
-# Unit + integration tests (race detection)
-go test -race ./...
-
-# Stage E2E tests (requires credentials)
-source .env
-go test -v -timeout 300s -run '^TestStage' ./cmd/pls-cli/
-```
-
-Tests auto-skip when `PLS_CLI_TEST_EMAIL` / `PLS_CLI_TEST_PASSWORD` are unset.
-
----
-
-## 10. Common Failures and Fixes
+## 11. Common Failures and Fixes
 
 | Symptom                                              | Cause                                          | Fix                                                                      |
 | ---------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------ |
@@ -514,10 +415,11 @@ Tests auto-skip when `PLS_CLI_TEST_EMAIL` / `PLS_CLI_TEST_PASSWORD` are unset.
 | Binary not found                                     | pls-cli not installed                          | Install from GitHub Releases (see Section 0)                             |
 | Installed `v1.0.0` while GitHub has newer            | Skill/docs pin went stale                      | Install the current release (v1.2.0 as of 2026-09)                       |
 | Dev build fails at login                             | No client ID burned in                         | Install the official release binary from GitHub Releases (see Section 0) |
+| `404 Not Found` on delete                            | Asset ID doesn't exist or already deleted      | Verify the asset ID with `pls-cli list`                                  |
 
 ---
 
-## 11. Environments
+## 12. Environments
 
 | Env        | API base                           | WS base                          | Login flag |
 | ---------- | ---------------------------------- | -------------------------------- | ---------- |
