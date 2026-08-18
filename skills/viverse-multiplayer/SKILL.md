@@ -56,10 +56,11 @@ Use when a project needs:
 4. **MUST** use **Session-Matching Alpha** to resolve local `actor_id` by matching local `session_id` against `mc.getMyRoomActors()` or `room.actors`.
 4A. **MUST** prefer the official factory `await playClient.newMultiplayerClient(roomId, appId, actorSessionId)`. It forwards positionally to `new playSDK.MultiplayerClient(roomId, appId, userSessionId)` **and** guarantees the Play SDK script is loaded/initialised first — manual construction does not. Note `newMatchmakingClient`/`newMultiplayerClient` live on the **viverse-sdk** (`window.viverse`), while the `MultiplayerClient` class itself lives in **play-sdk**; both script tags are required.
 4B. **MUST** construct `MultiplayerClient` with **positional** arguments when constructing manually: `new MultiplayerClient(roomId, appId, actorSessionId)`. The signature is `(roomId, appId, userSessionId)` and it only throws when `roomId`/`appId` are falsy — **never on wrong argument types**. Passing an options object (`new MultiplayerClient(roomId, { app_id, token, session_id })`) therefore silently sets `appId` to an object and leaves `userSessionId` undefined, which the SDK replaces with a random id; `peerId` is then derived from that random id and no longer matches your matchmaking actor. The gateway accepts the WebSocket join and creates the chat DataProducer, but the transport never completes, so `readyState` stays non-open and **every** gameplay packet is silently discarded forever.
-5. **MUST** initialize `MultiplayerClient` with `await mp.init({ modules: { general: { enabled: true } } })` before using `mp.general`.
+5. **MUST** initialize `MultiplayerClient` with `await mp.init({ modules: { general: { enabled: true } } })` before sending or expecting `mp.general` traffic. Lifecycle and receive callbacks should be registered first.
 5A. **MUST NOT** treat `await mp.init(...)` resolving as "ready to send". `init()` calls `mediasoupclient.connect()` **without awaiting it** and returns immediately; the WebRTC chat DataProducer that carries `general` messages opens later. `sendChatMessage()` bails with `console.warn("sendChatMessage() | chat DataProducer not open")` and **no return value**, so early sends are silently discarded while your code believes they succeeded.
-5B. **MUST** gate the first send on `mp.onConnected(...)` (which chains to the MediasoupClient's `onMyDataProducerConnected`, fired from the DataProducer's `open` event), and **MUST** queue outbound messages until it fires. Register it synchronously after `init()` — the SDK does not replay a missed `open`. Add a timeout fallback so a missed event cannot deadlock the game.
+5B. **MUST** gate the first send on `mp.onConnected(...)` (which chains to the MediasoupClient's `onMyDataProducerConnected`, fired from the DataProducer's `open` event), and **MUST** queue outbound messages until it fires. Register `onConnected`, `onDisconnected`, `onClientConnected`, and `onClientDisconnected` **before** `init()` starts the asynchronous mediasoup connection — the SDK does not replay a missed `open`. A timeout may activate an explicit degraded transport, but **MUST NOT** mark WebRTC ready without evidence.
 5C. **MUST NOT** rely on a single unacked packet for any state transition a player cannot recover from (game start above all). Provide at least two independent routes — see [patterns/start-signal-redundancy.md](patterns/start-signal-redundancy.md).
+5D. **MUST** prepare the host arena/resources successfully, then require the first `matchmakingClient.startGame()` call to return success before the host enters local gameplay or publishes a fallback that tells joiners the game started. Otherwise either side can enter a round the other side cannot run.
 6. **MUST NOT** call `mc.getActorId()` (non-existent API).
 7. **MUST NOT** depend on `updateRoom(...)` as a portable room-state API; use `setRoomProperties(...)` for room properties.
 8. **MUST** pass a raw room ID string to `joinRoom(...)` (not a room object).
@@ -229,12 +230,24 @@ if (existing) {
 ### 4) Start game (host only)
 
 ```javascript
-await matchmakingClient.startGame();
+if (!(await prepareRoundWithoutEnteringGameplay())) {
+  throw new Error("Host could not prepare the round");
+}
+const startResult = await matchmakingClient.startGame();
+if (startResult?.success === false) {
+  throw new Error(startResult.message || "Failed to start multiplayer game");
+}
+// Only now may the host enter local gameplay or publish a start fallback.
 ```
 
 Joiner side listens for `onGameStartNotify`.
 
 ### 5) Init MultiplayerClient for sync
+
+The realtime transport may be initialized as soon as each actor has successfully
+joined the same room; it does not need `onGameStartNotify`. That matchmaking
+event gates the gameplay transition, not the WebRTC connection. Whichever point
+the application chooses, both peers must use the same normalized room ID.
 
 ```javascript
 const MClient =
@@ -260,7 +273,6 @@ if (typeof playClient?.newMultiplayerClient === "function") {
 if (mp.userSessionId !== actorSessionId) {
   console.error("[MP] session id mismatch — realtime peer is not our actor", mp.userSessionId, actorSessionId);
 }
-await mp.init({ modules: { general: { enabled: true } } });
 
 // REQUIRED: init() resolving does NOT mean you can send — it fires
 // mediasoupclient.connect() un-awaited and returns. Queue until the chat
@@ -268,9 +280,25 @@ await mp.init({ modules: { general: { enabled: true } } });
 let realtimeReady = false;
 const outbox = [];
 const flush = () => { realtimeReady = true; outbox.splice(0).forEach((d) => mp.general.sendMessage(d)); };
-try { mp.onConnected(flush); } catch (_) { /* throws pre-init */ }
-setTimeout(() => { if (!realtimeReady) flush(); }, 8000);   // fallback: never deadlock
+mp.onConnected(flush);
+mp.onDisconnected(() => { realtimeReady = false; });
+mp.onClientConnected((peer) => console.log("realtime peer connected", peer));
+mp.onClientDisconnected((peer) => console.log("realtime peer disconnected", peer));
+
+await mp.init({ modules: { general: { enabled: true } } });
+
+setTimeout(() => {
+  if (!realtimeReady) activateExplicitDegradedTransport();
+}, 8000);
 ```
+
+Keep the identifiers distinct:
+
+- `roomId` scopes the matchmaking room and the `MultiplayerClient` transport.
+- `actorSessionId` is the peer identity and must equal `mp.userSessionId`.
+- An application `matchId` is optional round/version metadata for rejecting
+  delayed packets during rematches; it is not a room ID and does not reconnect
+  matchmaking or WebRTC.
 
 ### 5A) Template-Bound Projects
 

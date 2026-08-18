@@ -168,19 +168,21 @@ looks perfectly healthy because create/join/start ride the matchmaking socket.
 **Fix**: gate the first send on the real readiness signal and queue until then.
 
 ```javascript
-await mp.init({ modules: { general: { enabled: true } } });
-
 // mp.onConnected -> mediasoupclient.onConnected -> onMyDataProducerConnected,
-// fired from the chat DataProducer's "open" event. Register synchronously after
-// init(): the SDK does NOT replay a missed open.
+// fired from the chat DataProducer's "open" event. Register before init()
+// starts mediasoupclient.connect(): the SDK does NOT replay a missed open.
 let ready = false;
 const outbox = [];
-try {
-  mp.onConnected(() => { ready = true; outbox.splice(0).forEach(send); });
-} catch (_) { /* throws pre-init */ }
+mp.onConnected(() => { ready = true; outbox.splice(0).forEach(send); });
+mp.onDisconnected(() => { ready = false; });
+mp.onClientConnected((peer) => console.log("peer connected", peer));
+mp.onClientDisconnected((peer) => console.log("peer disconnected", peer));
 
-// Fallback so a missed event cannot deadlock the game.
-setTimeout(() => { if (!ready) { ready = true; outbox.splice(0).forEach(send); } }, 8000);
+await mp.init({ modules: { general: { enabled: true } } });
+
+// Never convert a timeout into false readiness. Switch to a separately defined
+// degraded transport, or keep state transitions on matchmaking.
+setTimeout(() => { if (!ready) activateExplicitDegradedTransport(); }, 8000);
 ```
 
 Never queue positional/transform updates — they are worthless once stale. Queue

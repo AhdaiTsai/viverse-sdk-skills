@@ -38,6 +38,35 @@ onSdkEvent(mc, "onGameStart",       (d) => { mpState.gameStarted = true; notify(
 Bridge both names — builds differ, and this event has been observed firing
 **twice**, so every consumer must be idempotent.
 
+## Defect 1B — the host started locally before the server
+
+Entering local host gameplay does not prove matchmaking accepted `startGame()`.
+If `startRound()` runs first, the host can appear healthy while the joiner never
+receives `onGameStartNotify`.
+
+```javascript
+// ❌ BUG — local success can hide a rejected server start
+await startRound();
+await matchmakingClient.startGame();
+```
+
+Require server acceptance first:
+
+```javascript
+if (!(await prepareRoundWithoutEnteringGameplay())) {
+  throw new Error("Host could not prepare the round");
+}
+const result = await matchmakingClient.startGame();
+if (result?.success === false) {
+  throw new Error(result.message || "Failed to start multiplayer game");
+}
+await publishStartFallback();
+await startRound();
+```
+
+For a rematch in the same room, keep the transport and generate a new
+application `matchId` to version the round. Do not run matchmaking again.
+
 ## Defect 2 — "entering the round" was never a function
 
 The host ran a full `startRound()`: build arena, hide the menu panel, place the

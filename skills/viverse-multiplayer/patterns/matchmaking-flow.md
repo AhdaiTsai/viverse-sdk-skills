@@ -135,19 +135,29 @@ Always normalize with `const room = data?.room || data`.
 
 Master starts:
 ```javascript
-await matchmakingClient.startGame();
+if (!(await prepareRoundWithoutEnteringGameplay())) {
+  throw new Error("Host could not prepare the round");
+}
+const result = await matchmakingClient.startGame();
+if (result?.success === false) {
+  throw new Error(result.message || "Failed to start multiplayer game");
+}
+// Enter host gameplay only after this succeeds.
 ```
 
 Non-master listens:
 ```javascript
 matchmakingClient.on("onGameStartNotify", () => {
-  // Init MultiplayerClient and enter game
+  // Enter game. Realtime may already be connecting from the room-join step.
 });
 ```
 
 ## 4. Init Multiplayer Client
 
-After start (both master and non-master):
+Both actors may initialize realtime immediately after they have joined the same
+room. `onGameStartNotify` is the gameplay-start signal; it is not required to
+create the WebRTC connection.
+
 ```javascript
 const roomId = room?.id || room?.roomId || room?.game_session;
 if (!roomId) throw new Error("roomId is required");
@@ -171,21 +181,22 @@ if (mp.userSessionId !== actorSessionId) {
   console.error("[MP] session id mismatch — realtime peer is not our actor", mp.userSessionId, actorSessionId);
 }
 
+let ready = false;
+const outbox = [];
+mp.onConnected(() => {
+  ready = true;
+  outbox.splice(0).forEach((message) => mp.general.sendMessage(message));
+});
+mp.onDisconnected(() => { ready = false; });
+mp.onClientConnected((peer) => console.log("peer connected", peer));
+mp.onClientDisconnected((peer) => console.log("peer disconnected", peer));
+mp.general?.onMessage?.((message) => console.log("message", message));
+
 await mp.init({
   modules: {
     general: { enabled: true }
   }
 });
-
-const onMessage = (msg) => console.log("message", msg);
-if (typeof mp.on === "function") {
-  mp.on("connected", () => console.log("connected"));
-  mp.on("message", onMessage);
-} else if (typeof mp.addEventListener === "function") {
-  mp.addEventListener("connected", () => console.log("connected"));
-  mp.addEventListener("message", onMessage);
-}
-mp.general?.onMessage?.(onMessage);
 ```
 
 When sending, call `mp.general.sendMessage(payload)` directly (do not detach the function reference), or Play SDK may throw `...reading 'sdk'`.
@@ -207,6 +218,10 @@ if (isHost && gameState.isStarted) {
   // clear timer on cleanup
 }
 ```
+
+An application `matchId` may version repeated rounds in this same room so stale
+packets are rejected. It does not replace `roomId`, identify a peer, or start a
+new matchmaking/WebRTC session.
 
 ## 6. Leave / Close Room Order (Important)
 
