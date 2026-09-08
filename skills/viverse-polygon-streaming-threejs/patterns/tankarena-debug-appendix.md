@@ -68,6 +68,22 @@ Use:
 
 Ship the file, but do not treat mascot failure alone as proof that the streamed model failed.
 
+### 8. `cameraTarget` must exist before scene content streams
+
+Do not read `orbitControls.target` while the scene constructor is still building meshes. Controls are often created after the castle/world load. Pass a `THREE.Vector3` into `StreamController` and copy the controls target into it later. An uncaught `undefined.target` during `new Game()` presents as a black screen, not as a streaming failure.
+
+### 9. Do not bbox-fit authored architecture
+
+TankArena needed bounding-box normalization for character-sized replacements. Fortress shells and other assets whose GLB path already applied world position/scale/yaw must keep that transform on the outer mount. Bbox-fitting those assets is a regression, not a missing polish step.
+
+### 10. One StreamController, many `addModel` callers
+
+`model-load` is indexed by `modelIndex` on a shared controller. Enemy, player, and world systems must not each assume they own every event.
+
+### 11. Assert Range with GET, not HEAD
+
+`curl -I -H 'Range: bytes=0-15'` returns 200. Use `curl` GET with a Range header and expect 206.
+
 ## Cheap Discriminators
 
 Before changing broad integration code, check these:
@@ -76,7 +92,7 @@ Before changing broad integration code, check these:
 2. one or more `GET 206` range responses
 3. `streamController.update()` running after `renderer.render()`
 4. wrapper success/error event name correctness
-5. post-load bounding-box fitting
+5. fit mode: `authored` vs bounding-box
 6. fallback hide/show policy
 7. whether the streamed content root actually gains children after success
 

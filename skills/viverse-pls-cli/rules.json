@@ -14,8 +14,8 @@
       "profiles": ["upload", "replace"],
       "phases": ["upload", "replace"],
       "type": "required_any",
-      "pattern": "source .env|\\$PLS_CLI_TEST_EMAIL|\\$PLS_CLI_TEST_PASSWORD",
-      "message": "Credentials must be loaded from env vars before running pls-cli commands.",
+      "pattern": "source .env|\\$PLS_CLI_TEST_EMAIL|\\$PLS_CLI_TEST_PASSWORD|\\$VIVERSE_TEST_EMAIL|\\$VIVERSE_TEST_PASSWORD",
+      "message": "Credentials must be loaded from env vars before running pls-cli commands (PLS_CLI_TEST_* or VIVERSE_TEST_* aliases).",
       "severity": "high"
     },
     {
@@ -24,7 +24,16 @@
       "phases": ["upload", "replace"],
       "type": "required_any",
       "pattern": "--json",
-      "message": "Always pass --json when parsing upload/replace output programmatically.",
+      "message": "Always pass --json when parsing upload/replace output programmatically. Parse the trailing JSON object; upload progress bars may precede it on stdout.",
+      "severity": "medium"
+    },
+    {
+      "id": "pls-cli-list-json-requires-group",
+      "profiles": ["upload", "replace"],
+      "phases": ["verify"],
+      "type": "forbidden_any",
+      "pattern": "pls-cli list --json(?!.*--group)|pls-cli list --json$",
+      "message": "pls-cli list --json requires --group; without it stdout can be empty.",
       "severity": "medium"
     },
     {
@@ -35,6 +44,6 @@
       "pattern": "pls-cli login.*--stage|bin/pls-cli login.*--stage",
       "message": "When uploading with --stage, ensure login was also performed with --stage flag.",
       "severity": "high"
-    },
+    }
   ]
 }

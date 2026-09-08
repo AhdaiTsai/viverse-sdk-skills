@@ -22,18 +22,21 @@ Operational guide for AI agents running pls-cli to upload or replace 3D models o
 
 ```bash
 which pls-cli || ls ~/bin/pls-cli 2>/dev/null || ls /usr/local/bin/pls-cli 2>/dev/null
+pls-cli version 2>/dev/null || true
 ```
 
-If found, skip this section.
+If a binary exists, still check the version. Do **not** keep `v1.0.0` when a newer release is available.
 
 ### Install from GitHub Releases (recommended)
+
+Pin to a checked GitHub release. As of 2026-09, use **`v1.2.0`**. Confirm the latest tag at `https://github.com/ViveportSoftware/pls-cli/releases` before installing; never default to `v1.0.0`.
 
 Detect OS and architecture, then download the correct binary:
 
 ```bash
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')   # darwin or linux
 ARCH=$(uname -m)                               # x86_64 or arm64
-VERSION="v1.0.0"                               # or latest tag from GitHub
+VERSION="v1.2.0"                               # verified 2026-09; bump after checking GitHub Releases
 
 # Normalise arch name
 case "$ARCH" in
@@ -74,13 +77,21 @@ pls-cli version
 ### Credential safety rule
 
 NEVER pass email or password as literal values in shell commands — they appear in logs.
-Always read from env vars:
+Always read from env vars. Canonical names:
+
+- `PLS_CLI_TEST_EMAIL`
+- `PLS_CLI_TEST_PASSWORD`
+- `PLS_CLI_TEST_GROUP_UUID` (optional; otherwise auto-select or pass `--group`)
+
+Some repos store the same account as `VIVERSE_TEST_EMAIL` / `VIVERSE_TEST_PASSWORD` (for example e2e env files). Map those before login; do not print the values:
 
 ```bash
-source .env   # loads PLS_CLI_TEST_EMAIL, PLS_CLI_TEST_PASSWORD, PLS_CLI_TEST_GROUP_UUID
+# Prefer PLS_CLI_* when set; otherwise accept VIVERSE_TEST_* aliases.
+export PLS_CLI_TEST_EMAIL="${PLS_CLI_TEST_EMAIL:-$VIVERSE_TEST_EMAIL}"
+export PLS_CLI_TEST_PASSWORD="${PLS_CLI_TEST_PASSWORD:-$VIVERSE_TEST_PASSWORD}"
 ```
 
-If `.env` doesn't exist, ask the user to set the variables in their terminal before proceeding.
+If neither pair exists, ask the user to set the variables in their terminal before proceeding.
 
 ---
 
@@ -162,7 +173,7 @@ pls-cli upload model.zip --json
 | `--resolution`     | performance/balanced/high/ultra | balanced      | -                                                 |
 | `--collider-scale` | 0.3/2/5/10/100                  | 2.0           | -                                                 |
 | `--secure`         | bool                            | false         | Encryption                                        |
-| `--json`           | bool                            | false         | Write JSON to stdout; human messages go to stderr |
+| `--json`           | bool                            | false         | Structured result is JSON, but **upload progress bars may still leak onto stdout**. Parse the trailing `{...}` object, do not `JSON.parse` the whole stream. Human messages also go to stderr. |
 | `--tags`           | comma-separated names           | -             | Auto-create missing tags and assign after upload  |
 
 ---
@@ -264,11 +275,77 @@ pls-cli upload model.glb --group=<group-uuid> --tags=foo,bar --json
 
 ---
 
+## 5.5 List assets and construct the playable `.xrg` URL
+
+Upload JSON returns `assetId` and `status` only. It does **not** return a resource URL. Agents must build the URL.
+
+```
+https://stream.viverse.com/polygon_file/<group-uuid>/<asset-id>/model.xrg
+```
+
+On stage, use `https://stream-stage.viverse.com` with the same path.
+
+**The `<group-uuid>` prefix is the asset group UUID, not the account id from `pls-cli status`.** Existing enemy/player XRGs in a group reuse that same prefix.
+
+### `pls-cli list`
+
+```bash
+# Human output auto-selects the first group if --group is omitted.
+pls-cli list
+
+# Machine-readable list REQUIRES --group. Without it, --json stdout can be empty
+# even though the command exits 0.
+pls-cli list --group=<group-uuid> --json
+```
+
+List JSON shape (v1.2.0):
+
+```json
+{
+  "assets": [
+    {
+      "id": "asset-uuid",
+      "name": "example-model",
+      "status": "ready",
+      "createdAt": "2026-01-01T00:00:00Z"
+    }
+  ]
+}
+```
+
+There is still no `url` field. After upload:
+
+1. Read `files[].assetId` from upload JSON (trailing object; see Section 6).
+2. Resolve `group-uuid` from `--group`, `PLS_CLI_TEST_GROUP_UUID`, or the `auto-selected group: ... (uuid)` line on human `pls-cli list` stderr/stdout.
+3. Write `https://stream.viverse.com/polygon_file/<group-uuid>/<assetId>/model.xrg` into the app manifest.
+4. Verify with a **GET** Range request, not `curl -I` plus a Range header (HEAD ignores Range and returns 200):
+
+```bash
+curl -s -D - -o /tmp/xrg.bin -H 'Range: bytes=0-15' \
+  "https://stream.viverse.com/polygon_file/<group-uuid>/<asset-id>/model.xrg"
+# Expect HTTP 206, content-range: bytes 0-15/<len>, body starting with v.00001
+```
+
+`HEAD` without Range returning 200 is a useful existence check; `GET` 206 is the streaming check.
+
+---
+
 ## 6. Machine-Readable Output (--json)
 
 Always pass `--json` when the result needs to be parsed programmatically.
 
-**Human-readable messages go to stderr; structured result goes to stdout.**
+**Intended split:** human-readable messages on stderr; structured result on stdout.
+
+**Actual upload behavior (v1.2.0):** S3 progress bars often print on **stdout** before the JSON object. `JSON.parse(stdout)` then fails. Extract the trailing JSON object:
+
+```python
+import json, re, sys
+raw = sys.stdin.read()
+match = re.search(r"\{[\s\S]*\}\s*$", raw)
+data = json.loads(match.group() if match else raw)
+```
+
+Redirect stdout to a file (`> /tmp/pls-upload.json`) and inspect stderr separately so progress noise does not mix with agent logs.
 
 ### Upload JSON output
 
@@ -360,10 +437,17 @@ When `--tags` is used, the upload JSON output includes a `"tags"` field:
 ### Shell parsing example
 
 ```bash
-# Check if upload succeeded
-result=$(pls-cli upload model.zip --json 2>/dev/null)
-status=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['files'][0]['status'])")
-asset_id=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['files'][0]['assetId'])")
+# Check if upload succeeded. Do not JSON.parse the raw stream; progress bars may precede JSON.
+pls-cli upload model.zip --json > /tmp/pls-upload.json 2>/tmp/pls-upload.err
+python3 - <<'PY'
+import json, re
+from pathlib import Path
+raw = Path("/tmp/pls-upload.json").read_text()
+match = re.search(r"\{[\s\S]*\}\s*$", raw)
+data = json.loads(match.group() if match else raw)
+file0 = data["files"][0]
+print(file0["status"], file0["assetId"])
+PY
 ```
 
 ---
@@ -375,7 +459,7 @@ Understanding this helps debug failures:
 ```
 1. Validate file (format, size, count)
 2. POST /management/asset  →  get { id, uploadUrl }
-3. PUT $uploadUrl  (S3 direct upload, shows progress bar on stderr)
+3. PUT $uploadUrl  (S3 direct upload; progress bar may print on stdout even with --json)
 4. POST /management/asset/:id/convert
 5. WebSocket wss://{domain}/management/user/ws  →  stream conversion progress
 6. Exit 0 on "ready", exit 1 on "failed"
@@ -424,7 +508,11 @@ Tests auto-skip when `PLS_CLI_TEST_EMAIL` / `PLS_CLI_TEST_PASSWORD` are unset.
 | Error code 1105                                      | Binary built without correct client ID ldflags | Install the official release binary from GitHub Releases (see Section 0) |
 | Error code 1108                                      | Scope not allowed                              | Don't pass extra `--scopes`                                              |
 | Conversion `status: "failed"`                        | Model file corrupted or unsupported            | Check `failedType` and `errorCode` in JSON output                        |
+| `JSON.parse` fails on `--json` upload stdout         | Progress bars mixed into stdout                | Parse the trailing `{...}` object, not the whole stream                  |
+| `list --json` empty / invalid JSON, exit 0           | `--group` omitted                              | Pass `--group=<uuid>`; human `list` without `--group` auto-selects       |
+| Built XRG 404                                        | Used account id from `status` as URL prefix    | Use the **group** UUID in `/polygon_file/<group>/<assetId>/model.xrg`    |
 | Binary not found                                     | pls-cli not installed                          | Install from GitHub Releases (see Section 0)                             |
+| Installed `v1.0.0` while GitHub has newer            | Skill/docs pin went stale                      | Install the current release (v1.2.0 as of 2026-09)                       |
 | Dev build fails at login                             | No client ID burned in                         | Install the official release binary from GitHub Releases (see Section 0) |
 
 ---

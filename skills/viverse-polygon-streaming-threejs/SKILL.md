@@ -23,7 +23,7 @@ Do not use this skill for direct `.glb` loading without Polygon Streaming or for
 
 - [ ] `npm install -S @polygon-streaming/web-player-threejs@2.9.0-beta.2`
 - [ ] `npm install -S three`
-- [ ] The app has a live `camera`, `renderer`, `scene`, and `cameraTarget`
+- [ ] The app has a live `camera`, `renderer`, `scene`, and a **stable `THREE.Vector3` `cameraTarget` that already exists before `new StreamController` / first `addModel`**
 - [ ] `/service-worker.js` is published at the web root
 - [ ] The app registers the Polygon Streaming service worker at runtime before constructing/loading streams
 - [ ] `/lib/basis_transcoder.js` is published at the web root
@@ -47,6 +47,10 @@ Do not use this skill for direct `.glb` loading without Polygon Streaming or for
 11. **MUST** decide explicitly whether the streamed asset replaces the whole actor or only one part of it.
 12. **MUST NOT** hide the fallback visual before `EVENT_MODEL_LOAD` or equivalent wrapper success is observed.
 13. **MUST** separate gameplay transform from streamed-content fitting by using an outer anchor plus an inner content root.
+14. **MUST** pass a `THREE.Vector3` `cameraTarget` that exists at controller construction time. Do **not** read `orbitControls.target` (or any controls object created later) while building the scene graph. Copy controls into that Vector3 after controls exist.
+15. **MUST** decide fit mode explicitly: `authored` (keep source placement/scale/yaw on the outer anchor; do not bbox-fit) vs `bbox` (normalize with `event.boundingBox`).
+16. **MUST** treat one `StreamController` as process-wide: `model-load` events are keyed by `modelIndex`. If castle, enemies, and player share a session, route events by owner; do not assume each system owns every event.
+17. **MUST NOT** let Polygon Streaming setup throw during scene/game construction. Keep the local fallback visible and log the failure.
 
 ## Verified SDK Behavior For `2.9.0-beta.2`
 
@@ -74,6 +78,27 @@ Copy these into your final app output:
 - `public/assets/viverse-symbol-anim.glb` -> `/assets/viverse-symbol-anim.glb`
 
 For Vite apps, place `viverse-symbol-anim.glb` under `public/assets/` so the build emits `dist/assets/viverse-symbol-anim.glb` without any runtime override.
+
+Copy the service worker and Basis files for **both** `vite build` and `vite dev`. `writeBundle` alone is not enough for local testing:
+
+```js
+function copyPolygonStreamingStatics(outDir) {
+  fs.copyFileSync(
+    'node_modules/@polygon-streaming/web-player-threejs/dist/service-worker.js',
+    path.join(outDir, 'service-worker.js'),
+  );
+  fs.mkdirSync(path.join(outDir, 'lib'), { recursive: true });
+  for (const file of ['basis_transcoder.js', 'basis_transcoder.wasm']) {
+    fs.copyFileSync(
+      `node_modules/three/examples/jsm/libs/basis/${file}`,
+      path.join(outDir, 'lib', file),
+    );
+  }
+}
+
+// configureServer: copy into `public/` for `npm run dev`
+// writeBundle: copy into `dist/` for production
+```
 
 If the app already has a custom root service worker, keep that registration and import the Polygon Streaming worker inside it with `importScripts('./service-worker.js')` rather than trying to register two competing root workers.
 
@@ -128,6 +153,25 @@ const streamController = new StreamController(
 );
 ```
 
+`cameraTarget` must be a `THREE.Vector3` the controller can hold by reference.
+
+```js
+// Good: exists before scene content starts streaming.
+const cameraTarget = new THREE.Vector3(0, 2, 1.5);
+const streamController = new StreamController(camera, renderer, scene, cameraTarget, options);
+
+// Later, after OrbitControls exist:
+if (controls?.target) cameraTarget.copy(controls.target);
+```
+
+```js
+// Bad: scene construction often runs before OrbitControls.
+// This throws and blacks the whole game if it happens in a constructor.
+new StreamController(camera, renderer, scene, this._controls.target, options);
+```
+
+Create **one** controller per page/session. If several systems call `addModel`, keep an owner table keyed by `event.modelIndex` instead of attaching competing `addEventListener` handlers that all treat every event as theirs.
+
 ### Step 4: Create a stable model anchor and content root
 
 ```js
@@ -174,6 +218,7 @@ streamController.addModel(
 ```js
 streamController.addEventListener(EVENT_MODEL_LOAD, (event) => {
   console.info('Polygon Streaming model loaded event', event);
+  // bbox mode only. Skip this call when fit is `authored`.
   fitStreamedModel(streamedContentRoot, event.boundingBox, {
     targetSize: 3.6,
     yOffset: 0.02,
@@ -191,7 +236,18 @@ Hide fallback visuals and apply post-load fitting from this wrapper event path, 
 
 If the package exposes the exported constants, prefer them over raw strings. If not, the current wrapper event names are `model-load` and `model-load-error`.
 
-### Step 7: Fit the streamed model to gameplay scale
+### Step 7: Choose authored fit vs bounding-box fit
+
+Decide this **before** writing fit code. Bounding-box normalization is correct for characters and kit that must match a gameplay capsule. It is **wrong** for assets whose local GLB path already used an authored world transform (position, uniform scale, yaw).
+
+| Fit mode | When | What to do on `model-load` |
+| --- | --- | --- |
+| `authored` | Fortress shells, placed architecture, anything whose GLB load already set `position` / `scale` / `rotation.y` | Put those values on the **outer** mount. Inner streamed root stays identity. Do not center or rescale from `event.boundingBox`. |
+| `bbox` | Characters, pickups, replacements that must match a target size | Keep gameplay on the outer anchor; fit the inner root with the helper below. |
+
+If you bbox-fit an authored castle, it will look tiny, huge, or leave the calibrated sockets.
+
+### Step 7b: Bounding-box fit (only for `bbox` mode)
 
 ```js
 function fitStreamedModel(contentRoot, boundingBox, { targetSize, yOffset }) {
@@ -253,6 +309,9 @@ Do not leave this implicit. If only part of the fallback is hidden, the final ac
 11. Bounding-box fitting and user tuning are separate steps. Fit first from `event.boundingBox`, then optionally apply a config multiplier such as `0.5` for art direction.
 12. Copying `/service-worker.js` into the build output without registering it can produce the exact symptom: no PS console logs after app startup and the fallback actor remains visible. Add a pre-await bootstrap log, register the worker, and use a timeout around `navigator.serviceWorker.ready`.
 13. If a streamed actor moves along the correct path but faces the opposite direction, the bug is usually the asset-local yaw offset, not the pathfinding or movement vector. Flip the streamed anchor yaw by 180 degrees (`rotationDeg`/`modelAnchor.rotation.y`) and keep gameplay rotation unchanged.
+14. A black screen / stuck loading overlay after enabling PS is often an uncaught throw while constructing `StreamController`, not a failed XRG. First suspect: `cameraTarget` read from `undefined` controls during scene `constructor`. Keep a Vector3 fallback and never let PS throw out of game bootstrap.
+15. Sharing one `StreamController` across enemies and world meshes is required (two controllers fight over the same renderer). Route `model-load` by `event.modelIndex`.
+16. `curl -I -H 'Range: bytes=0-15'` still returns **200**. Use a real `GET` with Range to assert **206**.
 
 ## Debugging Playbook
 
@@ -268,10 +327,10 @@ Check these first:
 
 Check these next:
 
-1. Is the content mounted under a separate child root for fitting?
-2. Did you normalize the model using `event.boundingBox`?
-3. Is the outer anchor doing gameplay transforms while the inner root handles centering/scale?
-4. Is the streamed model below the floor because `minY` was not aligned to the intended ground offset?
+1. Is the content mounted under a separate child root?
+2. If fit mode is `bbox`, did you normalize using `event.boundingBox`? If fit mode is `authored`, did you accidentally bbox-fit and destroy the source transform?
+3. Is the outer anchor doing gameplay / authored placement while the inner root stays identity (`authored`) or handles centering (`bbox`)?
+4. Is the streamed model below the floor because `minY` was not aligned, or because bbox-fit was applied to authored architecture?
 
 ### Symptom: only part of the actor is replaced
 
@@ -305,12 +364,24 @@ Check these next:
 3. Is the app fitting the model under a separate inner content root rather than moving the gameplay anchor itself?
 4. Is the fallback still visible only because post-load fit/offset leaves the streamed model inside it or under the floor?
 
+### Symptom: the page is a black screen or never leaves the loading overlay
+
+Polygon Streaming setup threw during `new Game()` / scene construction. Typical cause:
+
+```
+TypeError: Cannot read properties of undefined (reading 'target')
+```
+
+at `controls.target` while `_buildCastle` (or equivalent) runs **before** `OrbitControls` is created.
+
+Fix: construct a `THREE.Vector3` camera target first, create the controller with that vector, copy `controls.target` into it later, and wrap first `addModel` so construction failure keeps the GLB fallback.
+
 ### Symptom: you still suspect the SDK never loaded
 
 Use cheap discriminators before broad changes:
 
-1. Verify `HEAD 200` on the `.xrg` URL.
-2. Verify one or more `GET 206` range responses.
+1. Verify `HEAD 200` on the `.xrg` URL (existence).
+2. Verify `GET` with `Range: bytes=0-15` returns **206** (do not use `curl -I` for this).
 3. Verify `streamController.update()` runs after `renderer.render()`.
 4. Inspect internal engine state if needed:
   - `models.length`
@@ -328,7 +399,7 @@ If those counters advance, the problem has likely moved from transport into inte
 - [ ] `/service-worker.js` is requested from the app root
 - [ ] `/lib/basis_transcoder.js` and `/lib/basis_transcoder.wasm` are reachable
 - [ ] `/assets/viverse-symbol-anim.glb` is reachable from the app root
-- [ ] Streamed content is centered/scaled using the emitted bounding box
+- [ ] Fit mode is explicit: `authored` keeps source transform; `bbox` uses the emitted bounding box
 - [ ] Streamed content local yaw matches the gameplay actor's forward direction
 - [ ] Fallback is hidden only after wrapper success confirms the streamed model is usable
 - [ ] Any custom root service worker imports the PS worker instead of competing with it

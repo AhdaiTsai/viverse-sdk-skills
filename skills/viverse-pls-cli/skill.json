@@ -1,9 +1,9 @@
 {
   "id": "viverse-pls-cli",
   "name": "viverse-pls-cli",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "status": "active",
-  "description": "Upload and replace 3D model assets to VIVERSE using pls-cli",
+  "description": "Upload and replace 3D model assets to VIVERSE using pls-cli, including list --group, XRG URL construction, and mixed --json stdout parsing",
   "tags": ["viverse", "pls-cli", "upload", "assets", "3d-models", "cli"],
   "prerequisites": [
     "pls-cli binary (from GitHub Releases or built from source)",
