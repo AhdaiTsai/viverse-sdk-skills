@@ -1,9 +1,9 @@
 {
   "id": "viverse-auth",
   "name": "viverse-auth",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "status": "active",
-  "description": "VIVERSE Login SDK integration for user authentication and SSO",
+  "description": "VIVERSE Login SDK integration for user authentication and SSO, including iframe handshake delay, sparse-profile display names (UUID vs email local-part), and preview Me-API enrichment",
   "tags": [
     "viverse",
     "authentication",

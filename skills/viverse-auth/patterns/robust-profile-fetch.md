@@ -24,16 +24,48 @@ export async function fetchViverseProfile(vSdk, client, accessToken, accountId, 
     // Often name is hidden in the auth handshake itself before any API call
     if (authData) {
         try {
-            const recoveredName = authData.user_name || authData.display_name || authData.email || authData.name;
-            if (recoveredName && typeof recoveredName === 'string' && !recoveredName.includes('-')) {
+            const recoveredName = authData.user_name || authData.display_name || authData.nickName || authData.name;
+            if (recoveredName && typeof recoveredName === 'string' && !recoveredName.includes('@')) {
                 profile = { ...profile, displayName: recoveredName, name: recoveredName };
             }
+            if (authData.email) profile = { ...profile, email: authData.email };
         } catch (e) {}
     }
 
-    // Helper checks so we can stop only when identity is actually usable
-    const hasIdentity = (p) =>
-        !!(p && (p.displayName || p.display_name || p.name || p.nickname || p.userName || p.email));
+    const looksLikeUuid = (value) =>
+        typeof value === 'string' &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.trim());
+
+    const usableText = (value) => {
+        const text = String(value || '').trim();
+        if (!text || looksLikeUuid(text)) return '';
+        return text;
+    };
+
+    const emailLocalPart = (value) => {
+        const text = String(value || '').trim();
+        const at = text.lastIndexOf('@');
+        if (at <= 0) return '';
+        return usableText(text.slice(0, at));
+    };
+
+    const resolveDisplayName = (p) => {
+        if (!p || typeof p !== 'object') return 'VIVERSE Player';
+        const fullName = [usableText(p.firstName || p.first_name), usableText(p.lastName || p.last_name)]
+            .filter(Boolean)
+            .join(' ');
+        for (const candidate of [p.displayName, p.display_name, p.nickName, p.nickname, p.userName, p.name, fullName]) {
+            const text = usableText(candidate);
+            if (text && !text.includes('@')) return text;
+        }
+        return (
+            emailLocalPart(p.email) ||
+            emailLocalPart(p.accountEmail) ||
+            emailLocalPart(p.account_email) ||
+            'VIVERSE Player'
+        );
+    };
+
     const hasAvatar = (p) =>
         !!(p && (
             p.activeAvatar?.headIconUrl ||
@@ -63,7 +95,7 @@ export async function fetchViverseProfile(vSdk, client, accessToken, accountId, 
         } catch (e) {}
     }
 
-    const needsMoreProfile = (p) => !p || !hasIdentity(p) || !hasAvatar(p);
+    const needsMoreProfile = (p) => !p || resolveDisplayName(p) === 'VIVERSE Player' || !hasAvatar(p);
 
     // Strategy 2: client.getUserInfo() (Standard SDK)
     // Continue if profile is missing or incomplete
@@ -96,7 +128,9 @@ export async function fetchViverseProfile(vSdk, client, accessToken, accountId, 
         }
     }
 
-    // Strategy 5: Direct API Call (Last Resort)
+    // Strategy 5: Direct API Call (Last Resort).
+    // Do NOT skip this on *.world.viverse.app — preview is where first/last name is often empty.
+    // Time-box (~4s) so a CORS hang cannot stall auth; still attempt it.
     if (needsMoreProfile(profile) && accessToken) {
         try {
             const resp = await fetch('https://account-profile.htcvive.com/SS/Profiles/v3/Me', {
@@ -109,26 +143,9 @@ export async function fetchViverseProfile(vSdk, client, accessToken, accountId, 
         } catch (e) {}
     }
 
-    const looksLikeUuid = (value) =>
-        typeof value === 'string' &&
-        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.trim());
-
-    const preferredName =
-        profile?.name ||
-        profile?.displayName ||
-        profile?.display_name ||
-        profile?.nickName ||
-        profile?.nickname ||
-        profile?.userName ||
-        '';
-
-    const safeDisplayName = preferredName && !looksLikeUuid(preferredName)
-        ? preferredName
-        : 'VIVERSE Player';
-
     // Normalize the result
     return {
-        displayName: safeDisplayName,
+        displayName: resolveDisplayName(profile),
         avatarUrl:
             profile?.activeAvatar?.avatarUrl ||
             profile?.activeAvatar?.avatar_url ||
@@ -166,6 +183,15 @@ const fullProfile = await fetchViverseProfile(resolvedSdk, client, token, accoun
 
 3. **No-downgrade merge rule**
 - Never overwrite a specific resolved name with generic placeholders (`VIVERSE Player`, `Player-*`).
+
+4. **UUID `name` is not identity**
+- `hasIdentity` must not become true just because `name` is a UUID. Keep the fallback chain until `resolveDisplayName` returns a nick, first+last, or email local-part.
+
+5. **Email local-part, not full email**
+- Accounts with empty first/last should display the email local-part (text before `@`), not `VIVERSE Player` and not the full address.
+
+6. **Preview iframe still needs the Me API**
+- Do not skip `account-profile.htcvive.com/SS/Profiles/v3/Me` on `*.world.viverse.app`. Time-box (~4s) instead of omitting it.
 
 ## Usage Example
 

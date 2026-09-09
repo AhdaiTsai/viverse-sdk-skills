@@ -58,6 +58,9 @@ These are release blockers for any auth integration task:
 12. **MUST NOT** downgrade profile quality: generic fallback names (`VIVERSE Player`/`Player-*`) must not overwrite a previously resolved specific name.
 13. **MUST** use a single auth service as source of truth; do not keep parallel `ViverseService` implementations in different folders.
 14. **MUST** resolve App ID robustly: use `VITE_VIVERSE_CLIENT_ID` when valid, and in Worlds iframe fallback to hostname-derived app id (`<appId>-preview.world.viverse.app` -> `<appId>`).
+15. **MUST** treat UUID `name`/`displayName` and the generic `VIVERSE Player` as **missing identity**. Keep running the profile fallback chain until a real nick, first+last, or email exists.
+16. **MUST** resolve the chip name as: first+last → nick/`displayName` → **email local-part** (text before `@`). Never show a UUID, never show the full email, never skip enrichment because `name` looked truthy.
+17. **MUST NOT** skip `https://account-profile.htcvive.com/SS/Profiles/v3/Me` on `*.world.viverse.app`. Preview iframe is where sparse profiles show up. Time-box the fetch (about 4s); do not omit it.
 
 ## Implementation Workflow
 
@@ -156,11 +159,43 @@ if (vSdk?.avatar) {
   } catch (_) {}
 }
 
-const hasIdentity = (p) =>
-  !!(p && (p.name || p.displayName || p.display_name || p.nickName || p.nickname || p.userName || p.email));
+const looksLikeUuid = (value) =>
+  typeof value === 'string' &&
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.trim());
+
+const usableText = (value) => {
+  const text = String(value || '').trim();
+  if (!text || looksLikeUuid(text)) return '';
+  return text;
+};
+
+const emailLocalPart = (value) => {
+  const text = String(value || '').trim();
+  const at = text.lastIndexOf('@');
+  if (at <= 0) return '';
+  return usableText(text.slice(0, at));
+};
+
+const resolveDisplayName = (p) => {
+  if (!p || typeof p !== 'object') return 'VIVERSE Player';
+  const fullName = [usableText(p.firstName || p.first_name), usableText(p.lastName || p.last_name)]
+    .filter(Boolean)
+    .join(' ');
+  for (const candidate of [p.displayName, p.display_name, p.nickName, p.nickname, p.userName, p.name, fullName]) {
+    const text = usableText(candidate);
+    if (text && !text.includes('@')) return text;
+  }
+  return (
+    emailLocalPart(p.email) ||
+    emailLocalPart(p.accountEmail) ||
+    emailLocalPart(p.account_email) ||
+    'VIVERSE Player'
+  );
+};
+
 const hasAvatar = (p) =>
   !!(p && (p.activeAvatar?.avatarUrl || p.avatarUrl || p.avatar_url || p.profilePicUrl));
-const needsMoreProfile = (p) => !p || !hasIdentity(p) || !hasAvatar(p);
+const needsMoreProfile = (p) => !p || resolveDisplayName(p) === 'VIVERSE Player' || !hasAvatar(p);
 
 // 2) Bridge-safe fallback
 if (needsMoreProfile(mergedProfile) && client?.getUserInfo) {
@@ -177,7 +212,7 @@ if (needsMoreProfile(mergedProfile) && client?.getProfileByToken) {
   try { merge(await client.getProfileByToken(token)); } catch (_) {}
 }
 
-// 5) Optional direct API fallback (environment-dependent, may be blocked by CORS)
+// 5) Direct API fallback — still required on *.world.viverse.app; time-box if CORS hangs.
 if (needsMoreProfile(mergedProfile)) {
   try {
     const resp = await fetch('https://account-profile.htcvive.com/SS/Profiles/v3/Me', {
@@ -187,14 +222,7 @@ if (needsMoreProfile(mergedProfile)) {
   } catch (_) {}
 }
 
-const displayName =
-  mergedProfile?.displayName ||
-  mergedProfile?.display_name ||
-  mergedProfile?.name ||
-  mergedProfile?.nickname ||
-  mergedProfile?.userName ||
-  mergedProfile?.email ||
-  'VIVERSE Player';
+const displayName = resolveDisplayName(mergedProfile);
 
 const avatarUrl =
   mergedProfile?.activeAvatar?.headIconUrl ||
@@ -284,9 +312,10 @@ function App() {
 
 ## Profile Display Best Practices
 
-- Prefer profile fields (`name`, `displayName`, `display_name`, `userName`, `email`) for UI.
-- Treat raw `account_id` as an internal identifier only.
-- If profile is missing, use generic fallback `VIVERSE Player` only (never append account fragments).
+- Prefer a human nick or first+last name. Many VIVERSE accounts have **empty first/last name** and a UUID in `name`.
+- If the only identity is an email, show the **local-part** (before `@`), not the full address and not `VIVERSE Player`.
+- Treat raw `account_id` and UUID `name` as internal identifiers only.
+- If no nick/name/email local-part exists, use generic fallback `VIVERSE Player` only (never append account fragments).
 - Surface avatar via `headIconUrl`/`activeAvatar.headIconUrl` when available.
 
 ## Verification Checklist
@@ -325,7 +354,8 @@ function App() {
     }).catch(() => {});
   }
   ```
-- **Iframe Auth Hang (`checkAuth:ack`)**: If the application hangs on VIVERSE Studio or logs `unhandled methods: VIVERSE_SDK/checkAuth:ack`, it is almost always caused by an **App ID mismatch**. The VIVERSE parent iframe security model prevents the auth handshake if `clientId` (from your `.env` file) does not exactly match the App ID the iframe was launched with. Double check copied `.env` files.
+- **Iframe Auth Hang (`checkAuth:ack`)**: Parent log `unhandled methods: VIVERSE_SDK/checkAuth:ack` means the iframe did not consume the ack. Two common causes: (1) **App ID mismatch** (`clientId` ≠ launched app id), (2) **`checkAuth()` called before the mandatory 1200ms iframe handshake**. Shortening that delay (for example 300ms) drops the ack; auth may still finish later with a sparse profile (`VIVERSE Player`). Keep 1200ms. Do not treat this log as proof that SSO failed if `checkAuth()` later returns a token.
+- **Sparse profile on preview**: `checkAuth()` plus Avatar `getProfile()` often return a UUID `name` and no first/last. If `hasIdentity` treats that UUID as done, email enrichment never runs and the chip shows `VIVERSE Player`. Keep fetching until `resolveDisplayName` is a real nick or email local-part. Do **not** skip the Me profile API on `*.world.viverse.app`; time-box it (~4s) instead.
 - **Placeholder App ID trap**: If `.env` still has `VITE_VIVERSE_CLIENT_ID=YOUR_APP_ID`, auth may silently fall back to guest mode in preview even when publish uses correct `--app-id`. Build/runtime must resolve a real app id (env or iframe hostname fallback).
 - **TypeError: Cannot read properties of null (reading 'accountId')**: This occurs when `getProfile()` returns null (often due to App ID mismatch or invalid token) and the code tries to access `profile.accountId` without a check. **Safety Fix**: Always use optional chaining `profile?.accountId` or a null-guard `if (profile)`.
 - **Build-time env trap (Vite/React)**: `import.meta.env.VITE_*` is compiled at build time. If App ID changes, update `.env` and run a fresh `npm run build` before publishing. Re-publishing an old `dist` keeps the old/invalid App ID and causes guest-mode auth.

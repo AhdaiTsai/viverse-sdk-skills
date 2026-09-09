@@ -51,6 +51,10 @@ Do not use this skill for direct `.glb` loading without Polygon Streaming or for
 15. **MUST** decide fit mode explicitly: `authored` (keep source placement/scale/yaw on the outer anchor; do not bbox-fit) vs `bbox` (normalize with `event.boundingBox`).
 16. **MUST** treat one `StreamController` as process-wide: `model-load` events are keyed by `modelIndex`. If castle, enemies, and player share a session, route events by owner; do not assume each system owns every event.
 17. **MUST NOT** let Polygon Streaming setup throw during scene/game construction. Keep the local fallback visible and log the failure.
+18. **MUST** use **one** `StreamController` for the whole page. Never construct one controller per model.
+19. **MUST NOT** start two large `.xrg` `addModel` calls on the same tick after the service worker becomes ready. Queue them; prefer the currently visible variant only (for example medieval now, technology later).
+20. **MUST NOT** parse the original full-size `.glb` as a parallel fallback while streaming that same asset. Gameplay can proceed with an empty/cheap placeholder; load the GLB only if `EVENT_MODEL_LOAD_ERROR` fires.
+21. **MUST** register `/service-worker.js` on the **app iframe origin** (VIVERSE preview is `*-preview.world.viverse.app`). Do **not** register a root PS worker on `www.viverse.com`. `hostname.endsWith('viverse.com')` does **not** match `world.viverse.app`.
 
 ## Verified SDK Behavior For `2.9.0-beta.2`
 
@@ -171,6 +175,19 @@ new StreamController(camera, renderer, scene, this._controls.target, options);
 ```
 
 Create **one** controller per page/session. If several systems call `addModel`, keep an owner table keyed by `event.modelIndex` instead of attaching competing `addEventListener` handlers that all treat every event as theirs.
+
+Queue large `addModel` work. After `navigator.serviceWorker.ready`, the SDK starts decoding on the main thread. Starting two fortress-scale XRGs together has produced a **~100s** silent `requestAnimationFrame` stall with no further app logs until the tab recovers.
+
+```js
+let addModelChain = Promise.resolve();
+function enqueueAddModel(run) {
+  const queued = addModelChain.then(run, run);
+  addModelChain = queued.catch(() => {});
+  return queued;
+}
+```
+
+If the scene has mutually exclusive skins (upgrade tiers, LOD shells), call `addModel` only for the **visible** parent. Start the hidden variant when that parent is shown.
 
 ### Step 4: Create a stable model anchor and content root
 
@@ -294,6 +311,15 @@ Examples:
 
 Do not leave this implicit. If only part of the fallback is hidden, the final actor can look half-replaced even though PS loaded correctly.
 
+Do **not** download/parse the source `.glb` (multi-MB fortress shells) at the same time as `addModel`. That doubles main-thread work and can block castle-ready / first input. Prefer:
+
+1. empty inner `ps-fallback` group (or a cheap procedural stand-in)
+2. stream into `ps-streamed`
+3. hide fallback on `EVENT_MODEL_LOAD`
+4. load the GLB **only** on `EVENT_MODEL_LOAD_ERROR`
+
+A wall-clock "if not loaded in 12s, fetch the GLB" timer is harmful: a long hitch makes the timer fire immediately afterward and piles GLB parse on top of the stream.
+
 ## Known Gotchas
 
 1. `2.9.0-beta.2` still tries to load `/assets/viverse-symbol-anim.glb` as an internal loading animation. That is separate from your XRG.
@@ -312,6 +338,10 @@ Do not leave this implicit. If only part of the fallback is hidden, the final ac
 14. A black screen / stuck loading overlay after enabling PS is often an uncaught throw while constructing `StreamController`, not a failed XRG. First suspect: `cameraTarget` read from `undefined` controls during scene `constructor`. Keep a Vector3 fallback and never let PS throw out of game bootstrap.
 15. Sharing one `StreamController` across enemies and world meshes is required (two controllers fight over the same renderer). Route `model-load` by `event.modelIndex`.
 16. `curl -I -H 'Range: bytes=0-15'` still returns **200**. Use a real `GET` with Range to assert **206**.
+17. Two controllers fight over renderer, triangle budget, and the root service worker. One controller; many `addModel`s.
+18. Two large `addModel`s unblocked by the same `serviceWorker.ready` can freeze the game loop. Console clue: `[Violation] 'requestAnimationFrame' handler took 106288ms` right after `[PS] service worker ready`, then a gap with no app logs. Chrome also attributes background-tab wait to rAF, so confirm whether the iframe stayed visible.
+19. `service-worker.js: There has been a problem with sending traffic records: Failed to fetch` is SDK telemetry. It does not mean the XRG failed and must not block gameplay.
+20. VIVERSE preview loads the game in an iframe on `*.world.viverse.app`. Register the PS worker there. A worker on `www.viverse.com` would intercept the host shell.
 
 ## Debugging Playbook
 
@@ -376,6 +406,21 @@ at `controls.target` while `_buildCastle` (or equivalent) runs **before** `Orbit
 
 Fix: construct a `THREE.Vector3` camera target first, create the controller with that vector, copy `controls.target` into it later, and wrap first `addModel` so construction failure keeps the GLB fallback.
 
+### Symptom: load "hangs" over a minute with no PS error
+
+Look for:
+
+```
+[PS] service worker ready
+[Violation] 'requestAnimationFrame' handler took 106288ms
+```
+
+and no `[...] Polygon Streaming loaded` until much later.
+
+Cause is usually main-thread decode of **multiple** large XRGs (and/or parallel full GLB fallbacks) right after the worker is ready — not a failed URL.
+
+Fix: one controller, serialize `addModel`, stream only the visible variant, do not parse the original GLB until stream error. If the long rAF is paired with `visibilitychange` handler violations, the iframe may have been backgrounded; Chrome counts that idle time as rAF duration.
+
 ### Symptom: you still suspect the SDK never loaded
 
 Use cheap discriminators before broad changes:
@@ -404,4 +449,8 @@ If those counters advance, the problem has likely moved from transport into inte
 - [ ] Fallback is hidden only after wrapper success confirms the streamed model is usable
 - [ ] Any custom root service worker imports the PS worker instead of competing with it
 - [ ] Fallback policy matches the intended replacement mode
+- [ ] Only one `StreamController` exists; extra `addModel` calls share it
+- [ ] Boot logs one large `addModel` (visible variant), not two fortress-scale XRGs at once
+- [ ] Original full GLB is not fetched in parallel with the XRG
+- [ ] Preview iframe origin (`*.world.viverse.app`) owns `/service-worker.js`, not `www.viverse.com`
 - [ ] Fallback stays visible if load fails
