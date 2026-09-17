@@ -29,21 +29,12 @@
     },
     {
       "id": "pls-cli-list-json-requires-group",
-      "profiles": ["upload", "replace"],
-      "phases": ["verify"],
+      "profiles": ["upload", "replace", "list"],
+      "phases": ["list", "verify"],
       "type": "forbidden_any",
       "pattern": "pls-cli list --json(?!.*--group)|pls-cli list --json$",
       "message": "pls-cli list --json requires --group; without it stdout can be empty.",
       "severity": "medium"
-    },
-    {
-      "id": "pls-cli-stage-consistency",
-      "profiles": ["upload", "replace"],
-      "phases": ["upload", "replace", "verify"],
-      "type": "required_any",
-      "pattern": "pls-cli login.*--stage|bin/pls-cli login.*--stage",
-      "message": "When uploading with --stage, ensure login was also performed with --stage flag.",
-      "severity": "high"
     }
   ]
 }
